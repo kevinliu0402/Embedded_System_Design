@@ -1,0 +1,327 @@
+================================================================================
+                        ERROR REPORT
+================================================================================
+
+Project       : Maze Chase Game on DE1-SoC
+Course        : CSEE 4840 - Embedded Systems
+Reporter      :
+Date          : 2026-05-11
+Component     : [X] Hardware (FPGA)   [X] Software (HPS)   [ ] Toolchain   [ ] Other
+
+--------------------------------------------------------------------------------
+1. SUMMARY
+--------------------------------------------------------------------------------
+`insmod game.ko` is rejected with "No such device", and `./game_app`
+therefore cannot open `/dev/game`. The kernel module loads its code but
+the platform driver fails to bind because the running device tree has no
+node matching the driver's compatible string
+"csee4840,game_peripheral-1.0".
+
+--------------------------------------------------------------------------------
+2. ENVIRONMENT
+--------------------------------------------------------------------------------
+Host OS / kernel        : (host that ran scp / Quartus)
+Quartus version         : 21.1 (sopc2dts 20.1)
+SoC EDS version         : 21.1
+Target board            : Terasic DE1-SoC
+Linux image / kernel    : 4.19.0 (kernel-headers in /usr/src/linux-headers-4.19.0)
+Git commit / branch     :
+
+--------------------------------------------------------------------------------
+3. STEPS TO REPRODUCE
+--------------------------------------------------------------------------------
+1. scp game.c, game.h, game_app.c, maze_data.h, Makefile, README from host
+   into /root/final_project-sw/ on the board.
+2. ssh root@de1-soc, cd /root/final_project-sw.
+3. Build:    make
+4. Load:     insmod game.ko
+5. Run:      ./game_app
+
+Command(s) executed:
+    cd final_project-sw/
+    make
+    insmod game.ko
+    ./game_app
+
+--------------------------------------------------------------------------------
+4. EXPECTED BEHAVIOR
+--------------------------------------------------------------------------------
+- `insmod game.ko` returns 0 silently and `dmesg` shows
+      game: init
+      game: probed at 0xff200000 (size=64)
+- `/dev/game` exists (created by misc_register with .name = "game").
+- `./game_app` opens /dev/game, the VGA shows the maze, the evader
+  responds to keyboard input, and the two ghosts begin their BFS chase.
+
+--------------------------------------------------------------------------------
+5. ACTUAL BEHAVIOR
+--------------------------------------------------------------------------------
+- The build succeeds: game.ko and game_app are produced without errors.
+- `insmod game.ko` immediately fails. No /dev/game node is created.
+- `./game_app` aborts with "could not open /dev/game" and exits.
+- VGA output is unchanged (no maze, no sprites).
+
+--------------------------------------------------------------------------------
+6. ERROR MESSAGES / LOG OUTPUT
+--------------------------------------------------------------------------------
+Verbatim console transcript:
+
+```
+root@de1-soc:~# cd final_project-sw/
+root@de1-soc:~/final_project-sw# make
+make -C /usr/src/linux-headers-4.19.0 SUBDIRS=/root/final_project-sw modules
+make[1]: Entering directory '/usr/src/linux-headers-4.19.0'
+  CC [M]  /root/final_project-sw/game.o
+  Building modules, stage 2.
+  MODPOST 1 modules
+  CC      /root/final_project-sw/game.mod.o
+  LD [M]  /root/final_project-sw/game.ko
+make[1]: Leaving directory '/usr/src/linux-headers-4.19.0'
+cc -O2 -Wall -Wextra -o game_app game_app.c
+root@de1-soc:~/final_project-sw# insmod game.ko
+insmod: ERROR: could not insert module game.ko: No such device
+root@de1-soc:~/final_project-sw# ./game_app
+Maze Chase Game starting...
+could not open /dev/game: No such file or directory
+```
+
+--------------------------------------------------------------------------------
+7. AFFECTED FILES / MODULES
+--------------------------------------------------------------------------------
+File                                         | Line(s)  | Notes
+---------------------------------------------+----------+-----------------------
+final_project-sw/game.c                      | 212-216  | of_match_table entry
+                                             |          | declares compatible
+                                             |          | "csee4840,game_peripheral-1.0"
+final_project-sw/game.c                      | 228-232  | game_init() calls
+                                             |          | platform_driver_probe();
+                                             |          | returns -ENODEV when
+                                             |          | no DT node matches,
+                                             |          | which insmod reports
+                                             |          | as "No such device".
+final_project-sw/game.c                      | 151-155  | misc device "game"
+                                             |          | only registered from
+                                             |          | inside probe(), so no
+                                             |          | probe == no /dev/game.
+final_project-hw/soc_system.dts              | 98-100   | Device-tree node
+                                             |          | game_peripheral_0
+                                             |          | with the matching
+                                             |          | compatible string is
+                                             |          | present on the host.
+final_project-hw/soc_system.dtb              |   --     | Built from the .dts;
+                                             |          | apparently NOT copied
+                                             |          | to the board's boot
+                                             |          | partition (root cause
+                                             |          | candidate #1).
+final_project-hw/output_files/soc_system.rbf |   --     | FPGA bitstream that
+                                             |          | actually instantiates
+                                             |          | game_peripheral inside
+                                             |          | the FPGA fabric (root
+                                             |          | cause candidate #2 if
+                                             |          | the live FPGA image is
+                                             |          | the default lab3 one).
+
+--------------------------------------------------------------------------------
+8. ROOT CAUSE ANALYSIS
+--------------------------------------------------------------------------------
+`insmod` reporting "No such device" on a Linux platform driver is the
+userspace surface of probe() returning -ENODEV. In game.c, init is:
+
+    return platform_driver_probe(&game_driver, game_probe);
+
+`platform_driver_probe()` walks the platform-bus device list looking for
+a node whose `compatible` matches one in `game_of_match[]`. If no such
+node is found, it returns -ENODEV without ever calling our probe(), and
+no misc device is registered -- which is exactly why /dev/game is
+missing and `game_app`'s `open("/dev/game", ...)` fails with ENOENT.
+
+The host-side device tree (final_project-hw/soc_system.dts:98) does
+declare:
+
+    game_peripheral_0: game@0x100000000 {
+        compatible = "csee4840,game_peripheral-1.0";
+        reg = <0x00000001 0x00000000 0x00000040>;
+        ...
+    };
+
+so the *built* DT is correct. The mismatch is therefore between what
+was built on the host and what the board is actually running.
+
+Most likely cause (in priority order):
+  (a) The freshly compiled soc_system.dtb was never copied to the
+      board's FAT boot partition, so U-Boot is still loading an old DTB
+      (e.g. the lab3 one) that has no game_peripheral node. This is the
+      single most common explanation for "compiles fine, insmod says
+      No such device".
+  (b) The new soc_system.rbf was not copied either, so the FPGA still
+      holds the previous bitstream. Even with a correct DTB the driver
+      would still bind, but reads/writes would target unmapped fabric.
+  (c) U-Boot's environment is not actually loading socfpga.dtb /
+      soc_system.dtb at boot (e.g. fatload command points at a
+      different filename).
+  (d) The DTB on the SD card was overwritten by the distro and the
+      game_peripheral_0 node was lost.
+
+Confirmation steps to run on the board:
+    ls /proc/device-tree/sopc@0/bridge@0xc0000000/
+        -- look for a "game@..." entry
+    cat /proc/device-tree/sopc@0/bridge@0xc0000000/game@*/compatible
+        -- must print: csee4840,game_peripheral-1.0
+    dmesg | tail -50
+        -- after "insmod game.ko" should show "game: init" but no
+           "game: probed" line, which confirms probe() never ran.
+
+--------------------------------------------------------------------------------
+9. ATTEMPTED FIXES
+--------------------------------------------------------------------------------
+Attempt | Description                                       | Result
+--------+---------------------------------------------------+------------------
+1       | Rebuilt module with `make` on the board           | Build OK,
+        |                                                   | insmod still
+        |                                                   | fails with
+        |                                                   | "No such device"
+2       |                                                   |
+3       |                                                   |
+
+--------------------------------------------------------------------------------
+10. RESOLUTION / NEXT STEPS
+--------------------------------------------------------------------------------
+1. On the host:
+       cd final_project-hw
+       make rbf       # produces soc_system.rbf
+       make dtb       # produces soc_system.dtb
+2. Mount the SD card's FAT boot partition (or scp into /media/fat on
+   the running board if it auto-mounts), then copy BOTH artefacts:
+       cp output_files/soc_system.rbf  <FAT>/soc_system.rbf
+       cp soc_system.dtb               <FAT>/soc_system.dtb
+   Make sure the names match what U-Boot's bootcmd expects (commonly
+   `socfpga.rbf` and `socfpga.dtb`; check `printenv` in U-Boot or the
+   contents of u-boot.scr).
+3. Sync, eject, reboot the board.
+4. Verify before reloading the module:
+       cat /proc/device-tree/sopc@0/bridge@0xc0000000/game@*/compatible
+   (must print: csee4840,game_peripheral-1.0)
+5. Re-run:
+       cd /root/final_project-sw
+       insmod game.ko
+       dmesg | tail
+       ls -l /dev/game
+       ./game_app
+
+If step 4 still does not show the game node, the wrong DTB is being
+loaded -- inspect U-Boot's bootcmd / extlinux.conf and adjust the
+filename it loads.
+ls /proc/device-tree/sopc@0/bridge@0xc0000000/
+cat /proc/device-tree/sopc@0/bridge@0xc0000000/game@*/compatible
+# must print: csee4840,game_peripheral-1.0
+
+--------------------------------------------------------------------------------
+11. ATTACHMENTS / REFERENCES
+--------------------------------------------------------------------------------
+- final_project-sw/game.c                (driver source, lines 160-232)
+- final_project-hw/soc_system.dts        (lines 87-105: bridge + game node)
+- final_project-hw/output_files/soc_system.rbf
+- final_project-hw/soc_system.dtb
+- dmesg / kernel log on the board (to be captured after retry)
+
+
+root@de1-soc:~/final_project-sw# ls -la /mnt
+total 6880
+drwxr-xr-x  3 root root    4096 May 12 01:08 .
+drwxr-xr-x 21 root root    4096 Jan 24  2019 ..
+drwxr-xr-x  2 root root    4096 May 12 01:08 boot
+-rw-r--r--  1 root root   21919 May 12 02:36 soc_system.dtb
+-rw-r--r--  1 root root 7007204 May 12 02:36 soc_system.rbf
+
+# 1) Confirm what partitions exist and what's already mounted
+lsblk -f
+mount | grep -E 'mmcblk|vfat|fat'
+
+# 2) Try the conventional mountpoints on these images, in order:
+ls -la /boot              # often a mountpoint on DE1-SoC images
+ls -la /mnt/boot          # the empty dir we just saw
+
+root@de1-soc:~/final_project-sw# lsblk -f
+NAME        FSTYPE LABEL UUID                                 MOUNTPOINT
+mmcblk0                                                       
+|-mmcblk0p2 ext4         3dbcb478-f82f-43fc-9a18-2e2430e9b8d1 /
+|-mmcblk0p3                                                   
+`-mmcblk0p1 vfat         A26C-17FF                            
+root@de1-soc:~/final_project-sw# mount | grep -E 'mmcblk|vfat|fat'
+/dev/mmcblk0p2 on / type ext4 (rw,relatime)
+root@de1-soc:~/final_project-sw# ls -la /boot              # often a mountpoint on DE1-SoC images
+total 8
+drwxr-xr-x  2 root root 4096 Apr 12  2016 .
+drwxr-xr-x 21 root root 4096 Jan 24  2019 ..
+root@de1-soc:~/final_project-sw# ls -la /mnt/boot  
+total 8
+drwxr-xr-x 2 root root 4096 May 12 01:08 .
+drwxr-xr-x 3 root root 4096 May 12 01:08 ..
+
+# 1) Mount the FAT boot partition
+mount /dev/mmcblk0p1 /mnt/boot
+
+# 2) See what filenames U-Boot is actually loading
+ls -la /mnt/boot
+
+root@de1-soc:~/final_project-sw# mount /dev/mmcblk0p1 /mnt/boot
+
+# 1) What does the kernel think event1 is?
+cat /proc/bus/input/devices
+# Look for the block whose "Handlers" line contains "event1".
+# The "Name=" line will tell you exactly what it is, e.g.:
+#   N: Name="Logitech USB Keyboard"          <- good
+#   N: Name="USB Optical Mouse"              <- BAD, wrong device picked
+#   N: Name="gpio-keys"                      <- on-board buttons, wrong
+
+# 2) Does pressing the arrow keys actually generate events on event1?
+#    (Ctrl-C to stop; this just dumps raw input_event bytes.)
+hexdump -C /dev/input/event1
+# Press the four arrow keys. You should see lines streaming.
+# If nothing prints when you press arrows on the USB keyboard, event1
+# is not the keyboard.
+
+root@de1-soc:~/final_project-sw# cat /proc/bus/input/devices
+I: Bus=0003 Vendor=1c4f Product=0002 Version=0110
+N: Name="SIGMACHIP USB Keyboard"
+P: Phys=usb-ffb40000.usb-1.1/input0
+S: Sysfs=/devices/platform/sopc@0/ffb40000.usb/usb1/1-1/1-1.1/1-1.1:1.0/0003:1C4F:0002.0009/input/input12
+U: Uniq=
+H: Handlers=sysrq kbd leds event0
+B: PROP=0
+B: EV=120013
+B: KEY=10000 7 ff800000 7ff febeffdf f3cfffff ffffffff fffffffe
+B: MSC=10
+B: LED=7
+
+I: Bus=0003 Vendor=1c4f Product=0002 Version=0110
+N: Name="SIGMACHIP USB Keyboard Consumer Control"
+P: Phys=usb-ffb40000.usb-1.1/input1
+S: Sysfs=/devices/platform/sopc@0/ffb40000.usb/usb1/1-1/1-1.1/1-1.1:1.1/0003:1C4F:0002.000A/input/input13
+U: Uniq=
+H: Handlers=kbd event1
+B: PROP=0
+B: EV=1f
+B: KEY=3007f 0 0 0 0 483ffff 17aff32d bf544446 0 0 1 130c13 b17c000 267bfa d9415fed 9e1680 4400 0 10000002
+B: REL=40
+B: ABS=1 0
+B: MSC=10
+
+I: Bus=0003 Vendor=1c4f Product=0002 Version=0110
+N: Name="SIGMACHIP USB Keyboard System Control"
+P: Phys=usb-ffb40000.usb-1.1/input1
+S: Sysfs=/devices/platform/sopc@0/ffb40000.usb/usb1/1-1/1-1.1/1-1.1:1.1/0003:1C4F:0002.000A/input/input14
+U: Uniq=
+H: Handlers=kbd event2
+B: PROP=0
+B: EV=13
+B: KEY=c000 100000 0 0 0
+B: MSC=10
+
+root@de1-soc:~/final_project-sw# hexdump -C /dev/input/event1
+-bash: hexdump: command not found
+
+
+================================================================================
+                         END OF REPORT
+================================================================================

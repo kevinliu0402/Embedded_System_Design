@@ -1,0 +1,56 @@
+Maze Chase Game - HPS software (CSEE 4840 Final Project)
+=========================================================
+
+This directory contains the Linux device driver and user-space game
+application for the Maze Chase Game peripheral.  The layout follows
+lab3/lab3-sw exactly:
+
+    game.h        - shared ioctl definitions (kernel + user)
+    game.c        - kernel module (misc device /dev/game)
+    game_app.c    - user-space game loop (BFS, USB input, etc.)
+    maze_data.h   - auto-generated maze layout shared with the hardware
+    Makefile      - builds module + app
+
+`maze_data.h` is produced by ../final_project-hw/gen_mif.py; this
+guarantees the FPGA Maze ROM and the HPS collision array describe the
+exact same maze.
+
+------------------------------------------------------------------
+Building
+------------------------------------------------------------------
+On the DE1-SoC target:
+
+    make                         # builds game.ko and game_app
+
+Make sure the FPGA bitstream (../final_project-hw/output_files/soc_system.rbf)
+has already been written to the SD card and that the corresponding
+device tree blob has been installed; the kernel driver depends on the
+"csee4840,game_peripheral-1.0" compatible node.
+
+------------------------------------------------------------------
+Running
+------------------------------------------------------------------
+    echo 8 > /proc/sys/kernel/printk    # enable kernel printks
+    insmod game.ko
+    dmesg | tail
+    ls /dev/game                        # should exist
+    ./game_app
+
+A USB HID keyboard must be plugged into the DE1-SoC USB port.  Use
+arrow keys to move the Evader.  Press ENTER after a win/loss screen to
+restart.  Stop the application with Ctrl-C.
+
+To remove the module:
+
+    rmmod game
+
+------------------------------------------------------------------
+ioctl reference (defined in game.h)
+------------------------------------------------------------------
+    GAME_WRITE_STATE  - send new entity positions (and optionally
+                        GAME_STATUS) to the FPGA registers.
+    GAME_READ_STATE   - read TILE_STATUS, TILE*_TIME, GAME_STATUS,
+                        FRAME_SYNC into a single struct.
+    GAME_RESET_GAME   - pulse the self-clearing GAME_RESET bit.
+    GAME_WAIT_VSYNC   - busy-wait inside the driver until the FPGA
+                        frame counter advances (returns the new value).
